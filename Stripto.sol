@@ -348,15 +348,28 @@ contract Stripto is ERC20, Ownable {
 
     event EnabledTrading();
 
+    event RemovedLimits();
+
+    event DisabledTransferDelay();
+
     event ExcludeFromFees(address indexed account, bool isExcluded);
 
     event UpdatedMaxBuyAmount(uint256 newAmount);
 
     event UpdatedMaxSellAmount(uint256 newAmount);
 
-    event OperationsAddressUpdated(address indexed newWallet, address indexed oldWallet);
+    event UpdatedOperationsAddress(address indexed newWallet);
+
+    event UpdatedSwapTokensAtAmount(uint256 newAmount);
 
     event MaxTransactionExclusion(address _address, bool excluded);
+
+    event BuyFeesUpdated(uint256 operationsFee, uint256 liquidityFee);
+
+    event SellFeesUpdated(uint256 operationsFee, uint256 liquidityFee);
+
+    event WithdrawStuckETH(uint256 amount);
+    event FundsSentToOperations(uint256 amount);
 
     event SwapAndLiquify(
         uint256 tokensSwapped,
@@ -397,11 +410,11 @@ contract Stripto is ERC20, Ownable {
         _excludeFromMaxTransaction(address(0xdead), true);
 
         operationsAddress = address(newOwner);
+
+        excludeFromFees(newOwner, true);
+        excludeFromFees(address(this), true);
+        excludeFromFees(address(0xdead), true);
         
-        /*
-            _mint is an internal function in ERC20.sol that is only called here,
-            and CANNOT be called ever again
-        */
         _createInitialSupply(newOwner, totalSupply);
         transferOwnership(newOwner);
     }
@@ -425,6 +438,7 @@ contract Stripto is ERC20, Ownable {
         limitsInEffect = false;
         transferDelayEnabled = false;
         gasLimitActive = false;
+        emit RemovedLimits();
     }
     
     function removeBoughtEarly(address account) external onlyOwner {
@@ -435,6 +449,7 @@ contract Stripto is ERC20, Ownable {
     // disable Transfer delay - cannot be reenabled
     function disableTransferDelay() external onlyOwner {
         transferDelayEnabled = false;
+        emit DisabledTransferDelay();
     }
     
     function updateMaxBuyAmount(uint256 newNum) external onlyOwner {
@@ -454,6 +469,7 @@ contract Stripto is ERC20, Ownable {
   	    require(newAmount >= totalSupply() * 1 / 100000, "Swap amount cannot be lower than 0.001% total supply.");
   	    require(newAmount <= totalSupply() * 1 / 1000, "Swap amount cannot be higher than 0.1% total supply.");
   	    swapTokensAtAmount = newAmount;
+        emit UpdatedSwapTokensAtAmount(newAmount);
   	}
     
     function _excludeFromMaxTransaction(address updAds, bool isExcluded) private {
@@ -461,7 +477,7 @@ contract Stripto is ERC20, Ownable {
         emit MaxTransactionExclusion(updAds, isExcluded);
     }
 
-    function airdropToWallets(address[] memory airdropWallets, uint256[] memory amounts) external onlyOwner returns (bool){
+    function airdropToWallets(address[] memory airdropWallets, uint256[] memory amounts) external onlyOwner {
         require(!tradingActive, "Trading is already active, cannot airdrop after launch.");
         require(airdropWallets.length == amounts.length, "arrays must be the same length");
         require(airdropWallets.length < 200, "Can only airdrop 200 wallets per txn due to gas limits"); // allows for airdrop + launch at the same exact time, reducing delays and reducing sniper input.
@@ -470,7 +486,6 @@ contract Stripto is ERC20, Ownable {
             uint256 amount = amounts[i];
             _transfer(msg.sender, wallet, amount);
         }
-        return true;
     }
     
     function excludeFromMaxTransaction(address updAds, bool isEx) external onlyOwner {
@@ -478,6 +493,7 @@ contract Stripto is ERC20, Ownable {
             require(updAds != uniswapV2Pair, "Cannot remove uniswap pair from max txn");
         }
         _isExcludedMaxTransactionAmount[updAds] = isEx;
+        emit MaxTransactionExclusion(updAds, isExcluded);
     }
 
     function setAutomatedMarketMakerPair(address pair, bool value) external onlyOwner {
@@ -499,6 +515,7 @@ contract Stripto is ERC20, Ownable {
         buyLiquidityFee = _liquidityFee;
         buyTotalFees = buyOperationsFee + buyLiquidityFee;
         require(buyTotalFees <= 15, "Must keep fees at 15% or less");
+        emit BuyFeesUpdated(buyOperationsFee, buyLiquidityFee);
     }
 
     function updateSellFees(uint256 _operationsFee, uint256 _liquidityFee) external onlyOwner {
@@ -506,6 +523,7 @@ contract Stripto is ERC20, Ownable {
         sellLiquidityFee = _liquidityFee;
         sellTotalFees = sellOperationsFee + sellLiquidityFee;
         require(sellTotalFees <= 20, "Must keep fees at 20% or less");
+        emit SellFeesUpdated(sellOperationsFee, sellLiquidityFee);
     }
 
     function excludeFromFees(address account, bool excluded) public onlyOwner {
@@ -519,26 +537,26 @@ contract Stripto is ERC20, Ownable {
         require(to != address(0), "ERC20: transfer to the zero address");
         require(amount > 0, "amount must be greater than 0");
         
+        if(!tradingActive){
+             require(_isExcludedMaxTransactionAmount[from] || _isExcludedMaxTransactionAmount[to], "Trading is not active.");
+        }
         
         if(limitsInEffect){
-            if (from != owner() && to != owner() && to != address(0) && to != address(0xdead)){
-                if(!tradingActive){
-                    require(_isExcludedMaxTransactionAmount[from] || _isExcludedMaxTransactionAmount[to], "Trading is not active.");
-                }
-
+            if (from != owner() && to != owner() && to != address(0xdead)){
+                
                 // only use to prevent sniper buys in the first blocks.
                 if (gasLimitActive && automatedMarketMakerPairs[from]) {
                     require(tx.gasprice <= gasPriceLimit, "Gas price exceeds limit.");
                 }
                 
-                if(to != uniswapV2Pair && block.number <= tradingActiveBlock + 1){
+                if(!automatedMarketMakerPairs[to] && block.number <= tradingActiveBlock + 1){
                     boughtEarly[to] = true;
                     emit BoughtEarly(to);
                 }
                 
                 // at launch if the transfer delay is enabled, ensure the block timestamps for purchasers is set -- during launch.  
                 if (transferDelayEnabled){
-                    if (to != address(uniswapV2Router) && to != address(uniswapV2Pair)){
+                    if (to != address(uniswapV2Router) && !automatedMarketMakerPairs[to]){
                         require(_holderLastTransferTimestamp[tx.origin] < block.number, "_transfer:: Transfer Delay enabled.  Only one purchase per block allowed.");
                         _holderLastTransferTimestamp[tx.origin] = block.number;
                     }
@@ -582,7 +600,7 @@ contract Stripto is ERC20, Ownable {
                 tokensForOperations += fees * sellOperationsFee / sellTotalFees;
             }
             // on sell
-            if (automatedMarketMakerPairs[to] && sellTotalFees > 0){
+            else if (automatedMarketMakerPairs[to] && sellTotalFees > 0){
                 fees = amount * sellTotalFees /100;
                 tokensForLiquidity += fees * sellLiquidityFee / sellTotalFees;
                 tokensForOperations += fees * sellOperationsFee / sellTotalFees;
@@ -654,7 +672,7 @@ contract Stripto is ERC20, Ownable {
         uint256 ethBalance = address(this).balance;
         uint256 ethForLiquidity = ethBalance;
 
-        uint256 ethForOperations = ethBalance * tokensForOperations / totalTokensToSwap;
+        uint256 ethForOperations = ethBalance * tokensForOperations / (totalTokensToSwap - (tokensForLiquidity/2));
 
         ethForLiquidity -= ethForOperations;
             
@@ -665,7 +683,11 @@ contract Stripto is ERC20, Ownable {
             addLiquidity(liquidityTokens, ethForLiquidity);
         }
 
-        (success,) = address(operationsAddress).call{value: address(this).balance}("");
+        uint256 amountForOperations = address(this).balance;
+        (success,) = address(operationsAddress).call{value: amountForOperations}("");
+        if(success){
+            emit FundsSentToOperations(amountForOperations);
+        }
     }
 
     function transferForeignToken(address _token, address _to) external onlyOwner returns (bool _sent) {
@@ -679,6 +701,18 @@ contract Stripto is ERC20, Ownable {
     // withdraw ETH if stuck or someone sends to the address
     function withdrawStuckETH() external onlyOwner {
         bool success;
-        (success,) = address(msg.sender).call{value: address(this).balance}("");
+        uint256 amountForWithdraw = address(this).balance;
+        (success,) = address(msg.sender).call{value: amountForWithdraw}("");
+        if(success){
+            emit WithdrawStuckETH(amountForWithdraw);
+        }
+    }
+
+    function setOperationsAddress(address _operationsAddress) external onlyOwner {
+        require(_operationsAddress != address(0), "_operationsAddress address cannot be 0");
+        _isExcludedFromFees[operationsAddress] = false;
+        operationsAddress = payable(_operationsAddress);
+        _isExcludedFromFees[operationsAddress] = true;
+        emit UpdatedOperationsAddress(_operationsAddress);
     }
 }
